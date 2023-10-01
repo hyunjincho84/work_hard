@@ -1,260 +1,316 @@
-
-!cp /kaggle/input/datasets-wheel/datasets-2.14.4-py3-none-any.whl /kaggle/working
-!pip install  /kaggle/working/datasets-2.14.4-py3-none-any.whl
-!cp /kaggle/input/backup-806/util_openbook.py .
-
-# installing offline dependencies
-!pip install -U /kaggle/input/faiss-gpu-173-python310/faiss_gpu-1.7.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-!cp -rf /kaggle/input/sentence-transformers-222/sentence-transformers /kaggle/working/sentence-transformers
-!pip install -U /kaggle/working/sentence-transformers
-!pip install -U /kaggle/input/blingfire-018/blingfire-0.1.8-py3-none-any.whl
-
-!pip install --no-index --no-deps /kaggle/input/llm-whls/transformers-4.31.0-py3-none-any.whl
-!pip install --no-index --no-deps /kaggle/input/llm-whls/peft-0.4.0-py3-none-any.whl
-!pip install --no-index --no-deps /kaggle/input/llm-whls/trl-0.5.0-py3-none-any.whl
-
-from util_openbook import get_contexts, generate_openbook_output
-import pickle
-
-get_contexts()
-generate_openbook_output()
-
-import gc
-gc.collect()
-
-import pandas as pd
-backup_model_predictions = pd.read_csv("submission_backup.csv")
-
-import numpy as np
-import pandas as pd 
-from datasets import load_dataset, load_from_disk
-from sklearn.feature_extraction.text import TfidfVectorizer
-import torch
-from transformers import LongformerTokenizer, LongformerForMultipleChoice
-import transformers
-import pandas as pd
-import pickle
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import unicodedata
-
 import os
+import gc
+import pandas as pd
+import numpy as np
+import re
+from tqdm.auto import tqdm
+import blingfire as bf
+from __future__ import annotations
 
-!cp -r /kaggle/input/stem-wiki-cohere-no-emb /kaggle/working
-!cp -r /kaggle/input/all-paraphs-parsed-expanded /kaggle/working/
+from collections.abc import Iterable
 
-def SplitList(mylist, chunk_size):
-    return [mylist[offs:offs+chunk_size] for offs in range(0, len(mylist), chunk_size)]
+import faiss
+from faiss import write_index, read_index
 
-def get_relevant_documents_parsed(df_valid):
-    df_chunk_size=600
-    paraphs_parsed_dataset = load_from_disk("/kaggle/working/all-paraphs-parsed-expanded")
-    modified_texts = paraphs_parsed_dataset.map(lambda example:
-                                             {'temp_text':
-                                              f"{example['title']} {example['section']} {example['text']}".replace('\n'," ").replace("'","")},
-                                             num_proc=2)["temp_text"]
-    
-    all_articles_indices = []
-    all_articles_values = []
-    for idx in tqdm(range(0, df_valid.shape[0], df_chunk_size)):
-        df_valid_ = df_valid.iloc[idx: idx+df_chunk_size]
-    
-        articles_indices, merged_top_scores = retrieval(df_valid_, modified_texts)
-        all_articles_indices.append(articles_indices)
-        all_articles_values.append(merged_top_scores)
-        
-    article_indices_array =  np.concatenate(all_articles_indices, axis=0)
-    articles_values_array = np.concatenate(all_articles_values, axis=0).reshape(-1)
-    
-    top_per_query = article_indices_array.shape[1]
-    articles_flatten = [(
-                         articles_values_array[index],
-                         paraphs_parsed_dataset[idx.item()]["title"],
-                         paraphs_parsed_dataset[idx.item()]["text"],
-                        )
-                        for index,idx in enumerate(article_indices_array.reshape(-1))]
-    retrieved_articles = SplitList(articles_flatten, top_per_query)
-    return retrieved_articles
+from sentence_transformers import SentenceTransformer
 
+import torch
+import ctypes
+libc = ctypes.CDLL("libc.so.6")
 
+from dataclasses import dataclass
+from typing import Optional, Union
 
-def get_relevant_documents(df_valid):
-    df_chunk_size=800
-    
-    cohere_dataset_filtered = load_from_disk("/kaggle/working/stem-wiki-cohere-no-emb")
-    modified_texts = cohere_dataset_filtered.map(lambda example:
-                                             {'temp_text':
-                                              unicodedata.normalize("NFKD", f"{example['title']} {example['text']}").replace('"',"")},
-                                             num_proc=2)["temp_text"]
-    
-    all_articles_indices = []
-    all_articles_values = []
-    for idx in tqdm(range(0, df_valid.shape[0], df_chunk_size)):
-        df_valid_ = df_valid.iloc[idx: idx+df_chunk_size]
-    
-        articles_indices, merged_top_scores = retrieval(df_valid_, modified_texts)
-        all_articles_indices.append(articles_indices)
-        all_articles_values.append(merged_top_scores)
-        
-    article_indices_array =  np.concatenate(all_articles_indices, axis=0)
-    articles_values_array = np.concatenate(all_articles_values, axis=0).reshape(-1)
-    
-    top_per_query = article_indices_array.shape[1]
-    articles_flatten = [(
-                         articles_values_array[index],
-                         cohere_dataset_filtered[idx.item()]["title"],
-                         unicodedata.normalize("NFKD", cohere_dataset_filtered[idx.item()]["text"]),
-                        )
-                        for index,idx in enumerate(article_indices_array.reshape(-1))]
-    retrieved_articles = SplitList(articles_flatten, top_per_query)
-    return retrieved_articles
+import torch
+import numpy as np
+import pandas as pd
+from datasets import Dataset
+from transformers import AutoTokenizer
+from transformers import AutoModelForMultipleChoice, TrainingArguments, Trainer
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
+from torch.utils.data import DataLoader
+
+def process_documents(documents: Iterable[str],
+                      document_ids: Iterable,
+                      split_sentences: bool = True,
+                      filter_len: int = 3,
+                      disable_progress_bar: bool = False) -> pd.DataFrame:
+    """
+    Main helper function to process documents from the EMR.
+
+    :param documents: Iterable containing documents which are strings
+    :param document_ids: Iterable containing document unique identifiers
+    :param document_type: String denoting the document type to be processed
+    :param document_sections: List of sections for a given document type to process
+    :param split_sentences: Flag to determine whether to further split sections into sentences
+    :param filter_len: Minimum character length of a sentence (otherwise filter out)
+    :param disable_progress_bar: Flag to disable tqdm progress bar
+    :return: Pandas DataFrame containing the columns `document_id`, `text`, `section`, `offset`
+    """
+
+    df = sectionize_documents(documents, document_ids, disable_progress_bar)
+
+    if split_sentences:
+        df = sentencize(df.text.values,
+                        df.document_id.values,
+                        df.offset.values,
+                        filter_len,
+                        disable_progress_bar)
+    return df
 
 
+def sectionize_documents(documents: Iterable[str],
+                         document_ids: Iterable,
+                         disable_progress_bar: bool = False) -> pd.DataFrame:
+    """
+    Obtains the sections of the imaging reports and returns only the
+    selected sections (defaults to FINDINGS, IMPRESSION, and ADDENDUM).
 
-def retrieval(df_valid, modified_texts):
-    
-    corpus_df_valid = df_valid.apply(lambda row:
-                                     f'{row["prompt"]}\n{row["prompt"]}\n{row["prompt"]}\n{row["A"]}\n{row["B"]}\n{row["C"]}\n{row["D"]}\n{row["E"]}',
-                                     axis=1).values
-    vectorizer1 = TfidfVectorizer(ngram_range=(1,2),
-                                 token_pattern=r"(?u)\b[\w/.-]+\b|!|/|\?|\"|\'",
-                                 stop_words=stop_words)
-    vectorizer1.fit(corpus_df_valid)
-    vocab_df_valid = vectorizer1.get_feature_names_out()
-    vectorizer = TfidfVectorizer(ngram_range=(1,2),
-                                 token_pattern=r"(?u)\b[\w/.-]+\b|!|/|\?|\"|\'",
-                                 stop_words=stop_words,
-                                 vocabulary=vocab_df_valid)
-    vectorizer.fit(modified_texts[:500000])
-    corpus_tf_idf = vectorizer.transform(corpus_df_valid)
-    
-    print(f"length of vectorizer vocab is {len(vectorizer.get_feature_names_out())}")
+    :param documents: Iterable containing documents which are strings
+    :param document_ids: Iterable containing document unique identifiers
+    :param disable_progress_bar: Flag to disable tqdm progress bar
+    :return: Pandas DataFrame containing the columns `document_id`, `text`, `offset`
+    """
+    processed_documents = []
+    for document_id, document in tqdm(zip(document_ids, documents), total=len(documents), disable=disable_progress_bar):
+        row = {}
+        text, start, end = (document, 0, len(document))
+        row['document_id'] = document_id
+        row['text'] = text
+        row['offset'] = (start, end)
 
-    chunk_size = 100000
-    top_per_chunk = 10
-    top_per_query = 10
+        processed_documents.append(row)
 
-    all_chunk_top_indices = []
-    all_chunk_top_values = []
-
-    for idx in tqdm(range(0, len(modified_texts), chunk_size)):
-        wiki_vectors = vectorizer.transform(modified_texts[idx: idx+chunk_size])
-        temp_scores = (corpus_tf_idf * wiki_vectors.T).toarray()
-        chunk_top_indices = temp_scores.argpartition(-top_per_chunk, axis=1)[:, -top_per_chunk:]
-        chunk_top_values = temp_scores[np.arange(temp_scores.shape[0])[:, np.newaxis], chunk_top_indices]
-
-        all_chunk_top_indices.append(chunk_top_indices + idx)
-        all_chunk_top_values.append(chunk_top_values)
-
-    top_indices_array = np.concatenate(all_chunk_top_indices, axis=1)
-    top_values_array = np.concatenate(all_chunk_top_values, axis=1)
-    
-    merged_top_scores = np.sort(top_values_array, axis=1)[:,-top_per_query:]
-    merged_top_indices = top_values_array.argsort(axis=1)[:,-top_per_query:]
-    articles_indices = top_indices_array[np.arange(top_indices_array.shape[0])[:, np.newaxis], merged_top_indices]
-    
-    return articles_indices, merged_top_scores
-
-
-def prepare_answering_input(
-        tokenizer, 
-        question,  
-        options,   
-        context,   
-        max_seq_length=4096,
-    ):
-    c_plus_q   = context + ' ' + tokenizer.bos_token + ' ' + question
-    c_plus_q_4 = [c_plus_q] * len(options)
-    tokenized_examples = tokenizer(
-        c_plus_q_4, options,
-        max_length=max_seq_length,
-        padding="longest",
-        truncation=False,
-        return_tensors="pt",
-    )
-    input_ids = tokenized_examples['input_ids'].unsqueeze(0)
-    attention_mask = tokenized_examples['attention_mask'].unsqueeze(0)
-    example_encoded = {
-        "input_ids": input_ids.to(model.device.index),
-        "attention_mask": attention_mask.to(model.device.index),
-    }
-    return example_encoded
-
-In [ ]:
-stop_words = ['each', 'you', 'the', 'use', 'used',
-                  'where', 'themselves', 'nor', "it's", 'how', "don't", 'just', 'your',
-                  'about', 'himself', 'with', "weren't", 'hers', "wouldn't", 'more', 'its', 'were',
-                  'his', 'their', 'then', 'been', 'myself', 're', 'not',
-                  'ours', 'will', 'needn', 'which', 'here', 'hadn', 'it', 'our', 'there', 'than',
-                  'most', "couldn't", 'both', 'some', 'for', 'up', 'couldn', "that'll",
-                  "she's", 'over', 'this', 'now', 'until', 'these', 'few', 'haven',
-                  'of', 'wouldn', 'into', 'too', 'to', 'very', 'shan', 'before', 'the', 'they',
-                  'between', "doesn't", 'are', 'was', 'out', 'we', 'me',
-                  'after', 'has', "isn't", 'have', 'such', 'should', 'yourselves', 'or', 'during', 'herself',
-                  'doing', 'in', "shouldn't", "won't", 'when', 'do', 'through', 'she',
-                  'having', 'him', "haven't", 'against', 'itself', 'that',
-                  'did', 'theirs', 'can', 'those',
-                  'own', 'so', 'and', 'who', "you've", 'yourself', 'her', 'he', 'only',
-                  'what', 'ourselves', 'again', 'had', "you'd", 'is', 'other',
-                  'why', 'while', 'from', 'them', 'if', 'above', 'does', 'whom',
-                  'yours', 'but', 'being', "wasn't", 'be']
-
-In [ ]:
-df_valid = pd.read_csv("/kaggle/input/kaggle-llm-science-exam/test.csv")
-
-In [ ]:
-retrieved_articles_parsed = get_relevant_documents_parsed(df_valid)
-gc.collect()
-
-In [ ]:
-retrieved_articles = get_relevant_documents(df_valid)
-gc.collect()
-
-In [ ]:
-tokenizer = LongformerTokenizer.from_pretrained("/kaggle/input/longformer-race-model/longformer_qa_model")
-model = LongformerForMultipleChoice.from_pretrained("/kaggle/input/longformer-race-model/longformer_qa_model").cuda()
-
-In [ ]:
-predictions = []
-submit_ids = []
-
-for index in tqdm(range(df_valid.shape[0])):
-    columns = df_valid.iloc[index].values
-    submit_ids.append(columns[0])
-    question = columns[1]
-    options = [columns[2], columns[3], columns[4], columns[5], columns[6]]
-    context1 = f"{retrieved_articles[index][-4][2]}\n{retrieved_articles[index][-3][2]}\n{retrieved_articles[index][-2][2]}\n{retrieved_articles[index][-1][2]}"
-    context2 = f"{retrieved_articles_parsed[index][-3][2]}\n{retrieved_articles_parsed[index][-2][2]}\n{retrieved_articles_parsed[index][-1][2]}"
-    inputs1 = prepare_answering_input(
-        tokenizer=tokenizer, question=question,
-        options=options, context=context1,
-        )
-    inputs2 = prepare_answering_input(
-        tokenizer=tokenizer, question=question,
-        options=options, context=context2,
-        )
-    
-    with torch.no_grad():
-        outputs1 = model(**inputs1)    
-        losses1 = -outputs1.logits[0].detach().cpu().numpy()
-        probability1 = torch.softmax(torch.tensor(-losses1), dim=-1)
-        
-    with torch.no_grad():
-        outputs2 = model(**inputs2)
-        losses2 = -outputs2.logits[0].detach().cpu().numpy()
-        probability2 = torch.softmax(torch.tensor(-losses2), dim=-1)
-        
-    probability_ = (probability1 + probability2)/2
-
-    if probability_.max() > 0.4:
-        predict = np.array(list("ABCDE"))[np.argsort(probability_)][-3:].tolist()[::-1]
+    _df = pd.DataFrame(processed_documents)
+    if _df.shape[0] > 0:
+        return _df.sort_values(['document_id', 'offset']).reset_index(drop=True)
     else:
-        predict = backup_model_predictions.iloc[index].prediction.replace(" ","")
-    predictions.append(predict)
+        return _df
 
-predictions = [" ".join(i) for i in predictions]
 
-In [ ]:
-pd.DataFrame({'id':submit_ids,'prediction':predictions}).to_csv('submission.csv', index=False)
+def sentencize(documents: Iterable[str],
+               document_ids: Iterable,
+               offsets: Iterable[tuple[int, int]],
+               filter_len: int = 3,
+               disable_progress_bar: bool = False) -> pd.DataFrame:
+    """
+    Split a document into sentences. Can be used with `sectionize_documents`
+    to further split documents into more manageable pieces. Takes in offsets
+    to ensure that after splitting, the sentences can be matched to the
+    location in the original documents.
 
+    :param documents: Iterable containing documents which are strings
+    :param document_ids: Iterable containing document unique identifiers
+    :param offsets: Iterable tuple of the start and end indices
+    :param filter_len: Minimum character length of a sentence (otherwise filter out)
+    :return: Pandas DataFrame containing the columns `document_id`, `text`, `section`, `offset`
+    """
+
+    document_sentences = []
+    for document, document_id, offset in tqdm(zip(documents, document_ids, offsets), total=len(documents), disable=disable_progress_bar):
+        try:
+            _, sentence_offsets = bf.text_to_sentences_and_offsets(document)
+            for o in sentence_offsets:
+                if o[1]-o[0] > filter_len:
+                    sentence = document[o[0]:o[1]]
+                    abs_offsets = (o[0]+offset[0], o[1]+offset[0])
+                    row = {}
+                    row['document_id'] = document_id
+                    row['text'] = sentence
+                    row['offset'] = abs_offsets
+                    document_sentences.append(row)
+        except:
+            continue
+    return pd.DataFrame(document_sentences)
+SIM_MODEL = '/kaggle/input/sentencetransformers-allminilml6v2/sentence-transformers_all-MiniLM-L6-v2'
+DEVICE = 0
+MAX_LENGTH = 384
+BATCH_SIZE = 16
+
+WIKI_PATH = "/kaggle/input/wikipedia-20230701"
+wiki_files = os.listdir(WIKI_PATH)
+
+trn = pd.read_csv("/kaggle/input/kaggle-llm-science-exam/test.csv").drop("id", 1)
+trn.head()
+
+model = SentenceTransformer(SIM_MODEL, device='cuda')
+model.max_seq_length = MAX_LENGTH
+model = model.half()
+sentence_index = read_index("/kaggle/input/wikipedia-2023-07-faiss-index/wikipedia_202307.index")
+prompt_embeddings = model.encode(trn.prompt.values, batch_size=BATCH_SIZE, device=DEVICE, show_progress_bar=True, convert_to_tensor=True, normalize_embeddings=True)
+prompt_embeddings = prompt_embeddings.detach().cpu().numpy()
+_ = gc.collect()
+
+## Get the top 3 pages that are likely to contain the topic of interest
+search_score, search_index = sentence_index.search(prompt_embeddings, 3)
+## Save memory - delete sentence_index since it is no longer necessary
+del sentence_index
+del prompt_embeddings
+_ = gc.collect()
+libc.malloc_trim(0)
+
+df = pd.read_parquet("/kaggle/input/wikipedia-20230701/wiki_2023_index.parquet",
+                     columns=['id', 'file'])
+## Get the article and associated file location using the index
+wikipedia_file_data = []
+
+for i, (scr, idx) in tqdm(enumerate(zip(search_score, search_index)), total=len(search_score)):
+    scr_idx = idx
+    _df = df.loc[scr_idx].copy()
+    _df['prompt_id'] = i
+    wikipedia_file_data.append(_df)
+wikipedia_file_data = pd.concat(wikipedia_file_data).reset_index(drop=True)
+wikipedia_file_data = wikipedia_file_data[['id', 'prompt_id', 'file']].drop_duplicates().sort_values(['file', 'id']).reset_index(drop=True)
+
+## Save memory - delete df since it is no longer necessary
+del df
+_ = gc.collect()
+libc.malloc_trim(0)
+
+## Get the full text data
+wiki_text_data = []
+
+for file in tqdm(wikipedia_file_data.file.unique(), total=len(wikipedia_file_data.file.unique())):
+    _id = [str(i) for i in wikipedia_file_data[wikipedia_file_data['file']==file]['id'].tolist()]
+    _df = pd.read_parquet(f"{WIKI_PATH}/{file}", columns=['id', 'text'])
+
+    _df_temp = _df[_df['id'].isin(_id)].copy()
+    del _df
+    _ = gc.collect()
+    libc.malloc_trim(0)
+    wiki_text_data.append(_df_temp)
+wiki_text_data = pd.concat(wiki_text_data).drop_duplicates().reset_index(drop=True)
+_ = gc.collect()
+
+## Parse documents into sentences
+processed_wiki_text_data = process_documents(wiki_text_data.text.values, wiki_text_data.id.values)
+
+
+## Get embeddings of the wiki text data
+wiki_data_embeddings = model.encode(processed_wiki_text_data.text,
+                                    batch_size=BATCH_SIZE,
+                                    device=DEVICE,
+                                    show_progress_bar=True,
+                                    convert_to_tensor=True,
+                                    normalize_embeddings=True)#.half()
+wiki_data_embeddings = wiki_data_embeddings.detach().cpu().numpy()
+
+_ = gc.collect()
+## Combine all answers
+trn['answer_all'] = trn.apply(lambda x: " ".join([x['A'], x['B'], x['C'], x['D'], x['E']]), axis=1)
+
+
+## Search using the prompt and answers to guide the search
+trn['prompt_answer_stem'] = trn['prompt'] + " " + trn['answer_all']
+question_embeddings = model.encode(trn.prompt_answer_stem.values, batch_size=BATCH_SIZE, device=DEVICE, show_progress_bar=True, convert_to_tensor=True, normalize_embeddings=True)
+question_embeddings = question_embeddings.detach().cpu().numpy()
+
+## Parameter to determine how many relevant sentences to include
+NUM_SENTENCES_INCLUDE = 5
+
+## List containing just Context
+contexts = []
+
+for r in tqdm(trn.itertuples(), total=len(trn)):
+
+    prompt_id = r.Index
+
+    prompt_indices = processed_wiki_text_data[processed_wiki_text_data['document_id'].isin(wikipedia_file_data[wikipedia_file_data['prompt_id']==prompt_id]['id'].values)].index.values
+
+    if prompt_indices.shape[0] > 0:
+        prompt_index = faiss.index_factory(wiki_data_embeddings.shape[1], "Flat")
+        prompt_index.add(wiki_data_embeddings[prompt_indices])
+
+        context = ""
+
+        ## Get the top matches
+        ss, ii = prompt_index.search(question_embeddings, NUM_SENTENCES_INCLUDE)
+        for _s, _i in zip(ss[prompt_id], ii[prompt_id]):
+            context += processed_wiki_text_data.loc[prompt_indices]['text'].iloc[_i] + " "
+
+    contexts.append(context)
+
+trn['context'] = contexts
+trn[["prompt", "context", "A", "B", "C", "D", "E"]].to_csv("./test_context.csv", index=False)
+
+test_df = pd.read_csv("test_context.csv")
+test_df.index = list(range(len(test_df)))
+test_df['id'] = list(range(len(test_df)))
+test_df["prompt"] = test_df["context"].apply(lambda x: x[:1750]) + " #### " +  test_df["prompt"]
+test_df['answer'] = 'A'
+model_dir = "/kaggle/input/llm-science-run-context-2"
+tokenizer = AutoTokenizer.from_pretrained(model_dir)
+model = AutoModelForMultipleChoice.from_pretrained(model_dir).cuda()
+model.eval()
+
+# We'll create a dictionary to convert option names (A, B, C, D, E) into indices and back again
+options = 'ABCDE'
+indices = list(range(5))
+
+option_to_index = {option: index for option, index in zip(options, indices)}
+index_to_option = {index: option for option, index in zip(options, indices)}
+
+def preprocess(example):
+    # The AutoModelForMultipleChoice class expects a set of question/answer pairs
+    # so we'll copy our question 5 times before tokenizing
+    first_sentence = [example['prompt']] * 5
+    second_sentence = []
+    for option in options:
+        second_sentence.append(example[option])
+    # Our tokenizer will turn our text into token IDs BERT can understand
+    tokenized_example = tokenizer(first_sentence, second_sentence, truncation=True)
+    tokenized_example['label'] = option_to_index[example['answer']]
+    return tokenized_example
+@dataclass
+class DataCollatorForMultipleChoice:
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+
+    def __call__(self, features):
+        label_name = "label" if 'label' in features[0].keys() else 'labels'
+        labels = [feature.pop(label_name) for feature in features]
+        batch_size = len(features)
+        num_choices = len(features[0]['input_ids'])
+        flattened_features = [
+            [{k: v[i] for k, v in feature.items()} for i in range(num_choices)] for feature in features
+        ]
+        flattened_features = sum(flattened_features, [])
+
+        batch = self.tokenizer.pad(
+            flattened_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors='pt',
+        )
+        batch = {k: v.view(batch_size, num_choices, -1) for k, v in batch.items()}
+        batch['labels'] = torch.tensor(labels, dtype=torch.int64)
+        return batch
+tokenized_test_dataset = Dataset.from_pandas(test_df[['id', 'prompt', 'A', 'B', 'C', 'D', 'E', 'answer']].drop(columns=['id'])).map(preprocess, remove_columns=['prompt', 'A', 'B', 'C', 'D', 'E', 'answer'])
+tokenized_test_dataset = tokenized_test_dataset.remove_columns(["__index_level_0__"])
+data_collator = DataCollatorForMultipleChoice(tokenizer=tokenizer)
+test_dataloader = DataLoader(tokenized_test_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
+
+test_predictions = []
+for batch in test_dataloader:
+    for k in batch.keys():
+        batch[k] = batch[k].cuda()
+    with torch.no_grad():
+        outputs = model(**batch)
+    test_predictions.append(outputs.logits.cpu().detach())
+
+test_predictions = torch.cat(test_predictions)
+
+predictions_as_ids = np.argsort(-test_predictions, 1)
+
+predictions_as_answer_letters = np.array(list('ABCDE'))[predictions_as_ids]
+# predictions_as_answer_letters[:3]
+
+predictions_as_string = test_df['prediction'] = [
+    ' '.join(row) for row in predictions_as_answer_letters[:, :3]
+]
+
+submission = test_df[['id', 'prediction']]
+submission.to_csv('submission.csv', index=False)
